@@ -1,0 +1,6 @@
+tailored/
+__pycache__/
+*.pyc
+forbidden.txt
+identity.json
+.DS_Store
