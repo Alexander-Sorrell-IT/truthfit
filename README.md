@@ -24,6 +24,16 @@ python3 truthfit.py --resume base.docx --url https://jobs.ashbyhq.com/acme/123 -
 6. **Checks how parsers will read it.** Textkernel's published resume-quality codes, a PDF round trip (text layer, garbled glyphs, columns, header/footer, reading order), Word-file traps (tables, text boxes, columns, contact info in headers), and hidden or AI-directed text.
 7. **Tells you which engine reads this application** and what that engine documents about itself.
 
+## Default resume and live download counts
+
+```bash
+python3 truthfit.py --default --resume base.pdf --downloads packages.json --pdf
+```
+
+- `--default` writes the resume tailored to no job: your lines, your order, the same verifier, the same .md / .docx / .txt / .pdf outputs.
+- `--downloads packages.json` (`{"pypi": [...], "npm": [...], "descriptions": {...}}`) fetches live counts from pypistats.org (daily totals with mirrors) and api.npmjs.org (daily totals since first publish). It rewrites the resume's `N lifetime downloads across M published packages`, `PyPI (N installs): ...` and `npm (N installs): ...` lines, and replaces any old telemetry appendix with a fresh "Verified Package Telemetry" section: one line per package and the public URL that proves it. Works with `--default` or a tailored run.
+- Every URL, total and the exact `jq` command that reproduces it go in `downloads_receipt.json` next to the output. A failed fetch writes nothing, so a stale number never goes out. pypistats keeps 180 days; past that, a count is marked `+` as a floor.
+
 ## What it will never do
 
 - Write a skill, number, employer, title or result that isn't in your files.
@@ -40,7 +50,7 @@ python3 truthfit.py --resume base.docx --url https://jobs.ashbyhq.com/acme/123 -
 
 Plus optional `--identity` (your real email and phone must be present) and `--forbidden` (terms that must never appear — private project names, NDA'd clients). The `.docx` is converted back to text and verified the same way.
 
-`tests/` holds those guarantees as executable checks: invented bullets, inflated numbers in digits and words, scope inflation, unsupported skills, negated skills, forbidden terms, AI-directed text, a wrong target title. 19 tests, no network, no model.
+`tests/` holds those guarantees as executable checks: invented bullets, inflated numbers in digits and words, scope inflation, unsupported skills, negated skills, forbidden terms, AI-directed text, a wrong target title, download counts swapped and the old appendix dropped. 22 tests, no network, no model.
 
 ## Engines covered
 

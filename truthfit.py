@@ -669,7 +669,7 @@ def tailor(header, sections, kw, display, corpus, evidence_files, opts, log, req
 
 
     for sec in sections:
-        if sec["kind"] in ("summary", "education"):
+        if sec["kind"] in ("summary", "education") or norm(sec["title"]) == norm(DL_HEADING):
             continue
         new_parts = []
         for p in sec["parts"]:
@@ -770,6 +770,99 @@ def tailor(header, sections, kw, display, corpus, evidence_files, opts, log, req
             edu = next((i for i, s in enumerate(sections) if s["kind"] == "education"), len(sections))
             sections.insert(edu, sec)
     return header, sections
+
+
+# ───────────────────────────── live download counts ─────────────────────────────
+# The only lines truthfit writes that are not in your files. Every number comes from a public registry
+# fetched at run time, and the URL and raw totals behind it go in downloads_receipt.json next to the output.
+
+# numbers are patched in place, so bold, backticks and inline " - " bullets around them survive
+DL_SUMMARY = re.compile(r"[\d,]+\+?(?=(?:\*\*|__)? lifetime downloads(?:\*\*|__)? across \d+ published packages)", re.I)
+DL_REGISTRY = re.compile(r"\b(PyPI|npm) \([\d,]+\+? installs\)(:?(?:\*\*|__)?:?)(.*?)(?=\s+-\s+[*_]|$)", re.I)
+DL_APPENDIX = re.compile(r"\bpackage telemetry\b|package metrics|telemetry output", re.I)
+DL_HEADING = "## Verified Package Telemetry"
+
+
+def _get_retry(url, tries=4):
+    for i in range(tries):
+        try:
+            return _get(url, as_json=True)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or i == tries - 1:
+                raise
+            import time
+            time.sleep(3 * (i + 1))
+
+
+def fetch_downloads(cfg):
+    """Live counts for {"pypi": [...], "npm": [...]}. Any failed fetch raises — a stale number never reaches a resume."""
+    today = datetime.date.today().isoformat()
+    pkgs = []
+    for name in cfg.get("pypi", []):
+        rel = _get_retry(f"https://pypi.org/pypi/{name}/json")["releases"]
+        first = min(f["upload_time_iso_8601"][:10] for files in rel.values() for f in files)
+        url = f"https://pypistats.org/api/packages/{name}/overall"
+        rows = sorted((r for r in _get_retry(url)["data"] if r["category"] == "with_mirrors"), key=lambda r: r["date"])
+        pkgs.append({"registry": "PyPI", "package": name, "first_release": first, "source": url,
+                     "lifetime": sum(r["downloads"] for r in rows), "last_30_days": sum(r["downloads"] for r in rows[-30:]),
+                     # pypistats keeps 180 days; once the first release is older, the sum is a floor
+                     "floor": not rows or rows[0]["date"] > first,
+                     "verify": f"curl -s {url} | jq '[.data[] | select(.category==\"with_mirrors\") | .downloads] | add'"})
+    for name in cfg.get("npm", []):
+        first = _get_retry(f"https://registry.npmjs.org/{name}")["time"]["created"][:10]
+        url = f"https://api.npmjs.org/downloads/range/{first}:{today}/{name}"
+        days = _get_retry(url)["downloads"]
+        pkgs.append({"registry": "npm", "package": name, "first_release": first, "source": url,
+                     "lifetime": sum(d["downloads"] for d in days), "last_30_days": sum(d["downloads"] for d in days[-30:]),
+                     "floor": False, "verify": f"curl -s {url} | jq '[.downloads[].downloads] | add'"})
+    return {"fetched": datetime.datetime.now().isoformat(timespec="seconds"), "date": today, "packages": pkgs}
+
+
+def _count(pkgs):
+    return f"{sum(p['lifetime'] for p in pkgs):,}" + ("+" if any(p["floor"] for p in pkgs) else "")
+
+
+def _k(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def apply_downloads(md, stats, descriptions=None):
+    """Swap the resume's download lines for live counts and rebuild the telemetry appendix.
+    Returns (new_md, [(old line or None, new line)])."""
+    pkgs = stats["packages"]
+    by = {r: sorted((p for p in pkgs if p["registry"] == r), key=lambda p: -p["lifetime"]) for r in ("PyPI", "npm")}
+
+    def registry(m):
+        r = "PyPI" if m.group(1).lower() == "pypi" else "npm"
+        seg = m.group(3)
+        for p in by[r]:
+            seg = re.sub(r"(?<![\w-])(`?" + re.escape(p["package"]) + r"`?)(?: \([\d.,]+k?\))?(?![\w-])",
+                         lambda x: f"{x.group(1)} ({_k(p['lifetime'])})", seg)
+        return f"{m.group(1)} ({_count(by[r])} installs){m.group(2)}{seg}"
+
+    changes, out = [], []
+    for line in md.splitlines():
+        if DL_APPENDIX.search(line):
+            break                                        # the old appendix is replaced whole, below
+        new = DL_REGISTRY.sub(registry, DL_SUMMARY.sub(_count(pkgs), line))
+        if new != line:
+            changes.append((line, new))
+            line = new
+        out.append(line)
+    app = [DL_HEADING, "",
+           f"Live registry counts as of {stats['date']}. PyPI counts are pypistats.org daily totals including mirrors; "
+           "npm counts are api.npmjs.org daily totals since first publish.", ""]
+    for r in ("PyPI", "npm"):
+        for p in by[r]:
+            desc = (descriptions or {}).get(p["package"])
+            app.append(f"- {p['package']} ({r}): {p['lifetime']:,}{'+' if p['floor'] else ''} lifetime · "
+                       f"{p['last_30_days']:,} in the last 30 days · first release {p['first_release']}" + (f" — {desc}" if desc else ""))
+    app += ["", f"Totals: PyPI {_count(by['PyPI'])} · npm {_count(by['npm'])} · all {len(pkgs)} packages {_count(pkgs)}.", "",
+            "Check any count yourself, nothing to install. PyPI: add up the with_mirrors rows. npm: add up the daily downloads.", ""]
+    # plain URLs: code spans break apart in a PDF text layer; the exact jq commands are in the receipt
+    app += [f"- {p['package']}: {p['source']}" for r in ("PyPI", "npm") for p in by[r]]
+    changes += [(None, l) for l in app if l.strip()]
+    return "\n".join(out).rstrip() + "\n\n" + "\n".join(app) + "\n", changes
 
 
 TARGET_PREFIX = "Target role: "
@@ -1689,6 +1782,11 @@ def main(defaults=None):
     ap.add_argument("--forbidden", help="file of terms that must never appear in output (one per line); also $TRUTHFIT_FORBIDDEN")
     ap.add_argument("--name-prefix", help="output file name prefix (default: base resume file name)")
     ap.add_argument("--out-root", default=os.path.join(os.getcwd(), "tailored"), help="parent folder for run folders")
+    ap.add_argument("--default", action="store_true", help="a general resume tailored to no job: your lines in your order, verified the same way")
+    ap.add_argument("--downloads", metavar="PACKAGES.json", help='update the resume\'s download counts live from PyPI/npm; '
+                    'file is {"pypi": [...], "npm": [...], "descriptions": {...}}')
+    ap.add_argument("--drop", action="append", default=[], metavar="TEXT",
+                    help="remove every base line containing TEXT (repeatable); a TEXT that matches nothing stops the run")
     ap.add_argument("--check-file", help="audit an existing resume file (PDF/DOCX) for parseability and exit")
     ap.add_argument("--ats-map", nargs="*", metavar="FILE", help="classify every job link in these JSON/JSONL files by ATS engine")
     ap.add_argument("--ats-map-out", default="ATS_MAP.md", help="where --ats-map writes its table")
@@ -1708,11 +1806,13 @@ def main(defaults=None):
     if args.no_ai or not shutil.which("claude"):
         args.no_ai_screen = args.no_rewrite = args.no_ai = True
 
-    for p in [args.resume] + args.evidence + ([args.jd_file] if args.jd_file else []):
+    for p in [args.resume] + args.evidence + ([args.jd_file] if args.jd_file else []) + ([args.downloads] if args.downloads else []):
         if not os.path.isfile(p):
             sys.exit(f"File not found: {p}")
+    if args.default:
+        sys.exit(default_run(args))
     if not (args.url or args.jd_file or args.jd_text):
-        sys.exit("Give the job: --url, --jd-file or --jd-text")
+        sys.exit("Give the job: --url, --jd-file or --jd-text (or --default for a resume tailored to no job)")
 
     # ── the job
     title, company, jd_parts = args.title or "", args.company or "", []
@@ -1749,18 +1849,7 @@ def main(defaults=None):
     if not kw:
         sys.exit("No keywords found in the job description — check the input.")
 
-    # ── sources
-    base_md = read_any(args.resume)
-    evidence_files = [(os.path.basename(p), read_any(p)) for p in args.evidence]
-    corpus = Corpus([(os.path.basename(args.resume), base_md)] + evidence_files)
-    identity = json.load(open(args.identity)) if args.identity and os.path.isfile(args.identity) else None
-
-    hidden = hidden_text_findings(args.resume, base_md)
-    if hidden:
-        print("⛔ Your base resume contains hidden or AI-directed text. ATSs and recruiters treat this as cheating:")
-        for h in hidden[:10]:
-            print("   ", h)
-        sys.exit("Remove it from the base resume, then re-run.")
+    base_md, evidence_files, corpus, identity, dl = load_sources(args)
     log = {"reordered": [], "trimmed": []}
     header, sections = parse_resume(base_md)
     header, sections = tailor(header, sections, kw, display, corpus, evidence_files, args, log, reqs)
@@ -1781,20 +1870,8 @@ def main(defaults=None):
 
     # ── verdict
     fails = verify(md, base_md, corpus, identity, rewrites, vocab, target)
-    docx_path = os.path.join(out, base_name + ".docx")
-    if not fails and shutil.which("pandoc"):
-        tmp_md = os.path.join(out, ".verify.md")
-        open(tmp_md, "w").write(md)
-        cmd = ["pandoc", tmp_md, "-o", docx_path]
-        if args.resume.lower().endswith(".docx"):
-            cmd += ["--reference-doc", args.resume]
-        subprocess.run(cmd, check=True)
-        os.remove(tmp_md)
-        back = tables_to_lines(subprocess.run(["pandoc", docx_path, "-t", "gfm", "--wrap=none"],
-                                              capture_output=True, text=True, check=True).stdout)
-        fails += [f"[docx round-trip] {f}" for f in verify(back, base_md, corpus, identity, rewrites, vocab, target)]
-        if fails:
-            os.remove(docx_path)
+    if not fails:
+        fails += write_docx(md, out, base_name, args, lambda back: verify(back, base_md, corpus, identity, rewrites, vocab, target))
 
     before, after = coverage(base_md, kw), coverage(md, kw)
     scr_before, grade_before = screen(base_md, reqs, kw, args.ai_terms)
@@ -1808,8 +1885,9 @@ def main(defaults=None):
               f"- Generated: {datetime.datetime.now():%Y-%m-%d %H:%M}",
               f"- Base resume: `{args.resume}`",
               f"- Job URL: {args.url or '—'}", f"- JD file: {args.jd_file or '—'}",
-              f"- Evidence files: {', '.join(f'`{p}`' for p in args.evidence) or '—'}", "",
-              f"## Verdict: {'✅ PASS — every line traced to your sources (verbatim or gated rewrite)' if not fails else '⛔ FAIL — resume NOT written'}", ""]
+              f"- Evidence files: {', '.join(f'`{p}`' for p in args.evidence) or '—'}", ""]
+    report += downloads_report(dl, out)
+    report += [f"## Verdict: {'✅ PASS — every line traced to your sources (verbatim or gated rewrite)' if not fails else '⛔ FAIL — resume NOT written'}", ""]
     report += [f"- {f}" for f in fails] + ([""] if fails else [])
     report += [f"## JD keyword coverage (weighted): {before}% → {after}%", "",
                "Top JD keywords (weight): " + ", ".join(f"{display.get(t, t)} ({w:g})" for t, w in list(kw.items())[:30]), "",
@@ -1952,8 +2030,142 @@ def main(defaults=None):
             print("   ", f)
         sys.exit(2)
 
+    write_files(md, md_verbatim if rewrites else None, out, base_name, args)
+
+    print(f"\n✅ PASS — every line traces to your files ({'verbatim' if not rewrites else f'verbatim, or one of {len(rewrites)} gated rewrites of a verbatim line'}).")
+    print(f"   JD keyword coverage: {before}% → {after}%   added to skills: {len(log['added'])}   "
+          f"evidence bullets: {len(log['evidence'])}   gaps (not added): {len(log['gaps'])}")
+    print(f"   Rewrites: {len(log.get('rewrites', []))} accepted, {len(log.get('rewrite_rejected', []))} rejected by the gates")
+    print(f"   Screener grade (simulated): {grade_before} → {grade}   basic met: "
+          f"{sum(x['status'] == 'meets' for x in scr if x['tier'] == 'basic')}/{sum(x['tier'] == 'basic' for x in scr)}"
+          + (f"   real AI grade: {ai.get('grade')}" if ai else (f"   AI: {ai_err}" if ai_err else "")))
+    finish(issues, out, dl)
+
+
+def load_sources(args):
+    """Base resume (with live download counts swapped in when --downloads is given), evidence, corpus, identity."""
+    base_md = read_any(args.resume)
+    hidden = hidden_text_findings(args.resume, base_md)
+    if hidden:
+        print("⛔ Your base resume contains hidden or AI-directed text. ATSs and recruiters treat this as cheating:")
+        for h in hidden[:10]:
+            print("   ", h)
+        sys.exit("Remove it from the base resume, then re-run.")
+    if args.drop:
+        base_md, dropped = drop_lines(base_md, args.drop)
+        for d in dropped:
+            print(f"  dropped: {d[:110]}")
+    dl = None
+    if args.downloads:
+        cfg = json.load(open(args.downloads))
+        print(f"Fetching live download counts for {len(cfg.get('pypi', [])) + len(cfg.get('npm', []))} packages...")
+        try:
+            stats = fetch_downloads(cfg)
+        except Exception as e:
+            sys.exit(f"⛔ FAIL-CLOSED — a registry fetch failed ({e}). No resume written; stale counts never go out.")
+        base_md, changes = apply_downloads(base_md, stats, cfg.get("descriptions"))
+        dl = {"stats": stats, "changes": changes}
+    evidence_files = [(os.path.basename(p), read_any(p)) for p in args.evidence]
+    # with --downloads the base is your resume plus the receipt-backed lines; everything else is still verbatim
+    corpus = Corpus([(os.path.basename(args.resume), base_md)] + evidence_files)
+    identity = json.load(open(args.identity)) if args.identity and os.path.isfile(args.identity) else None
+    return base_md, evidence_files, corpus, identity, dl
+
+
+def drop_lines(md, texts):
+    """Remove lines (a wrapped paragraph or bullet counts as one) containing any of texts. Only removes, so verbatim holds."""
+    out, dropped, hit = [], [], set()
+    for line in md.splitlines():
+        found = [t for t in texts if t.lower() in norm(line).lower()]
+        if found:
+            hit.update(found)
+            dropped.append(norm(line))
+        else:
+            out.append(line)
+    missing = [t for t in texts if t not in hit]
+    if missing:
+        sys.exit(f"⛔ --drop matched nothing for: {', '.join(missing)} — check the spelling; nothing written.")
+    return "\n".join(out) + "\n", dropped
+
+
+def downloads_report(dl, out):
+    if not dl:
+        return []
+    json.dump(dl["stats"], open(os.path.join(out, "downloads_receipt.json"), "w"), indent=1)
+    rep = [f"## Download counts — live from the registries {dl['stats']['fetched']} (receipt: downloads_receipt.json)", ""]
+    for old, new in dl["changes"]:
+        rep += [f"- WAS: {old.strip()}", f"  NOW: {new.strip()}"] if old else [f"- ADDED: {new.strip()}"]
+    if any(p["floor"] for p in dl["stats"]["packages"]):
+        rep.append("- '+' marks a floor: pypistats keeps 180 days and that package is older")
+    return rep + [""]
+
+
+def write_docx(md, out, base_name, args, check):
+    """Write the .docx, read it back to text, and run the verifier on what Word will actually hold."""
+    if not shutil.which("pandoc"):
+        return []
+    docx_path = os.path.join(out, base_name + ".docx")
+    tmp_md = os.path.join(out, ".verify.md")
+    open(tmp_md, "w").write(md)
+    cmd = ["pandoc", tmp_md, "-o", docx_path]
+    if args.resume.lower().endswith(".docx"):
+        cmd += ["--reference-doc", args.resume]
+    subprocess.run(cmd, check=True)
+    os.remove(tmp_md)
+    back = tables_to_lines(subprocess.run(["pandoc", docx_path, "-t", "gfm", "--wrap=none"],
+                                          capture_output=True, text=True, check=True).stdout)
+    fails = [f"[docx round-trip] {f}" for f in check(back)]
+    if fails:
+        os.remove(docx_path)
+    return fails
+
+
+def default_run(args):
+    """--default: the resume tailored to no job. Same sources, same verifier, same file outputs."""
+    base_md, _, corpus, identity, dl = load_sources(args)
+    header, sections = parse_resume(base_md)
+    md = render(header, sections)
+    out = args.out or os.path.join(args.out_root, f"{datetime.date.today().isoformat()}_default")
+    os.makedirs(out, exist_ok=True)
+    base_name = (args.name_prefix or slug(os.path.splitext(os.path.basename(args.resume))[0])) + "_default"
+    fails = verify(md, base_md, corpus, identity)
+    if not fails:
+        fails += write_docx(md, out, base_name, args, lambda back: verify(back, base_md, corpus, identity))
+    issues = lint(md, args.resume, {}, {})
+    report = [f"# truthfit — default resume (no job)", "", f"- Generated: {datetime.datetime.now():%Y-%m-%d %H:%M}",
+              f"- Base resume: `{args.resume}`", ""]
+    report += downloads_report(dl, out)
+    report += [f"## Verdict: {'✅ PASS — every line traced to your sources' if not fails else '⛔ FAIL — resume NOT written'}", ""]
+    report += [f"- {f}" for f in fails] + ([""] if fails else [])
+    report += ["## Parser-quality checks (Textkernel/Sovren resume-quality codes)", ""]
+    report += [f"- [{sev}] ({code}) {msg}" for code, sev, msg in issues if code != "112"] or ["- none"]
+    open(os.path.join(out, "REPORT.md"), "w").write("\n".join(report) + "\n")
+    if fails:
+        print(f"\n⛔ FAIL-CLOSED — {len(fails)} check(s) failed. No resume written. See {out}/REPORT.md")
+        for f in fails[:15]:
+            print("   ", f)
+        return 2
+    write_files(md, None, out, base_name, args)
+    print("\n✅ PASS — default resume, every line traces to your files" + (" or the live registry receipt." if dl else "."))
+    finish([i for i in issues if i[0] != "112"], out, dl)
+    return 0
+
+
+def finish(issues, out, dl):
+    if dl:
+        print(f"   Downloads: {_count(dl['stats']['packages'])} lifetime across {len(dl['stats']['packages'])} packages "
+              f"(live {dl['stats']['date']}, receipt in downloads_receipt.json)")
+    for code, sev, msg in issues:
+        if sev in ("FATAL", "MAJOR"):
+            print(f"   ⚠ [{sev}] {msg}")
+    print(f"   Output: {out}/")
+    for f in sorted(os.listdir(out)):
+        print(f"     {f}")
+
+
+def write_files(md, md_verbatim, out, base_name, args):
     open(os.path.join(out, base_name + ".md"), "w").write(md)
-    if rewrites:
+    if md_verbatim:
         vb = os.path.join(out, base_name + "_verbatim")
         open(vb + ".md", "w").write(md_verbatim)
         cmd = ["pandoc", vb + ".md", "-o", vb + ".docx"] + (["--reference-doc", args.resume] if args.resume.lower().endswith(".docx") else [])
@@ -1979,19 +2191,6 @@ def main(defaults=None):
         else:
             print("  ⚠ --pdf needs typst (brew install typst); .docx written instead")
 
-    print(f"\n✅ PASS — every line traces to your files ({'verbatim' if not rewrites else f'verbatim, or one of {len(rewrites)} gated rewrites of a verbatim line'}).")
-    print(f"   JD keyword coverage: {before}% → {after}%   added to skills: {len(log['added'])}   "
-          f"evidence bullets: {len(log['evidence'])}   gaps (not added): {len(log['gaps'])}")
-    print(f"   Rewrites: {len(log.get('rewrites', []))} accepted, {len(log.get('rewrite_rejected', []))} rejected by the gates")
-    print(f"   Screener grade (simulated): {grade_before} → {grade}   basic met: "
-          f"{sum(x['status'] == 'meets' for x in scr if x['tier'] == 'basic')}/{sum(x['tier'] == 'basic' for x in scr)}"
-          + (f"   real AI grade: {ai.get('grade')}" if ai else (f"   AI: {ai_err}" if ai_err else "")))
-    for code, sev, msg in issues:
-        if sev in ("FATAL", "MAJOR"):
-            print(f"   ⚠ [{sev}] {msg}")
-    print(f"   Output: {out}/")
-    for f in sorted(os.listdir(out)):
-        print(f"     {f}")
 
 
 if __name__ == "__main__":
