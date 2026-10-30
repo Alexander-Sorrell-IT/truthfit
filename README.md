@@ -32,6 +32,7 @@ python3 truthfit.py --default --resume base.pdf --downloads packages.json --pdf
 
 - `--default` writes the resume tailored to no job: your lines, your order, the same verifier, the same .md / .docx / .txt / .pdf outputs.
 - `--downloads packages.json` (`{"pypi": [...], "npm": [...], "descriptions": {...}}`) fetches live counts from pypistats.org (daily totals with mirrors) and api.npmjs.org (daily totals since first publish). It rewrites the resume's `N lifetime downloads across M published packages`, `PyPI (N installs): ...` and `npm (N installs): ...` lines, and replaces any old telemetry appendix with a fresh "Verified Package Telemetry" section: one line per package and the public URL that proves it. Works with `--default` or a tailored run.
+- `--drop TEXT` removes every base line containing TEXT for this version (repeatable). It only removes, so the verbatim guarantee holds, and a TEXT that matches nothing stops the run.
 - Every URL, total and the exact `jq` command that reproduces it go in `downloads_receipt.json` next to the output. A failed fetch writes nothing, so a stale number never goes out. pypistats keeps 180 days; past that, a count is marked `+` as a floor.
 
 ## What it will never do
@@ -50,7 +51,7 @@ python3 truthfit.py --default --resume base.pdf --downloads packages.json --pdf
 
 Plus optional `--identity` (your real email and phone must be present) and `--forbidden` (terms that must never appear — private project names, NDA'd clients). The `.docx` is converted back to text and verified the same way.
 
-`tests/` holds those guarantees as executable checks: invented bullets, inflated numbers in digits and words, scope inflation, unsupported skills, negated skills, forbidden terms, AI-directed text, a wrong target title, download counts swapped and the old appendix dropped. 22 tests, no network, no model.
+`tests/` holds those guarantees as executable checks: invented bullets, inflated numbers in digits and words, scope inflation, unsupported skills, negated skills, forbidden terms, AI-directed text, a wrong target title, download counts swapped, the old appendix dropped, --drop typos stopped. 24 tests, no network, no model.
 
 ## Engines covered
 
