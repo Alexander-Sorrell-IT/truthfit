@@ -158,5 +158,60 @@ class Tailor(unittest.TestCase):
         self.assertNotIn("MongoDB", md)
 
 
+STATS = {"date": "2026-10-30", "fetched": "2026-10-30T00:00:00", "packages": [
+    {"registry": "PyPI", "package": "pkg-a", "first_release": "2026-06-29", "lifetime": 10286, "last_30_days": 1339,
+     "floor": False, "source": "https://pypistats.org/api/packages/pkg-a/overall", "verify": ""},
+    {"registry": "npm", "package": "pkg-b", "first_release": "2026-08-14", "lifetime": 2805, "last_30_days": 699,
+     "floor": False, "source": "https://api.npmjs.org/downloads/range/2026-08-14:2026-10-30/pkg-b", "verify": ""}]}
+
+DL_BASE = BASE.replace("- Wrote the on-call runbook.", """- Wrote the on-call runbook.
+
+36,262 lifetime downloads across 2 published packages on PyPI and npm.
+PyPI (27,619 installs): pkg-a (8.5k).
+npm (8,643 installs): pkg-b (1.4k).
+
+Sam Example — Verified Package Telemetry
+pip │ pkg-a │ 8,627""")
+
+
+class Downloads(unittest.TestCase):
+    """Live counts replace the old ones; the stale appendix goes; nothing else changes."""
+
+    def test_counts_replaced_and_appendix_rebuilt(self):
+        md, changes = T.apply_downloads(DL_BASE, STATS, {"pkg-a": "Does A."})
+        self.assertIn("13,091 lifetime downloads across 2 published packages", md)
+        self.assertIn("PyPI (10,286 installs): pkg-a (10.3k).", md)
+        self.assertIn("npm (2,805 installs): pkg-b (2.8k).", md)
+        self.assertIn("- pkg-a (PyPI): 10,286 lifetime · 1,339 in the last 30 days · first release 2026-06-29 — Does A.", md)
+        self.assertNotIn("36,262", md)
+        self.assertNotIn("8,627", md)                       # old appendix is gone
+        self.assertIn("- Wrote the on-call runbook.", md)
+        self.assertEqual(sum(1 for o, n in changes if o), 3)
+
+    def test_floor_is_marked(self):
+        stats = {**STATS, "packages": [dict(STATS["packages"][0], floor=True), STATS["packages"][1]]}
+        md, _ = T.apply_downloads(DL_BASE, stats)
+        self.assertIn("13,091+ lifetime downloads", md)
+
+    def test_default_resume_verifies_and_still_fails_closed(self):
+        md, _ = T.apply_downloads(DL_BASE, STATS)
+        corpus = T.Corpus([("base.md", md)])
+        out = T.render(*T.parse_resume(md))
+        self.assertEqual(T.verify(out, md, corpus, None), [])
+        self.assertTrue(T.verify(out.replace("10,286 lifetime", "12,286 lifetime"), md, corpus, None))
+
+
+class Drop(unittest.TestCase):
+    def test_drop_removes_and_still_verifies(self):
+        md, dropped = T.drop_lines(BASE, ["on-call runbook"])
+        self.assertNotIn("runbook", md)
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(T.verify(T.render(*T.parse_resume(md)), md, T.Corpus([("base.md", md)]), None), [])
+
+    def test_drop_typo_stops_the_run(self):
+        with self.assertRaises(SystemExit):
+            T.drop_lines(BASE, ["no such line"])
+
+
 if __name__ == "__main__":
     unittest.main()
